@@ -66,6 +66,7 @@ function init(env) {
       "CREATE TABLE IF NOT EXISTS user_accounts (id TEXT PRIMARY KEY, username TEXT NOT NULL COLLATE NOCASE UNIQUE, salt TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL)",
       "CREATE TABLE IF NOT EXISTS user_playlists (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, is_public INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, UNIQUE(user_id, name))",
       "CREATE TABLE IF NOT EXISTS user_playlist_tracks (playlist_id TEXT NOT NULL, track_id TEXT NOT NULL, added_at INTEGER NOT NULL, PRIMARY KEY (playlist_id, track_id))",
+      "CREATE TABLE IF NOT EXISTS playlist_hearts (playlist_id TEXT NOT NULL, voter TEXT NOT NULL, PRIMARY KEY (playlist_id, voter))",
       "CREATE TABLE IF NOT EXISTS peer_track_refs (ref TEXT PRIMARY KEY, origin TEXT NOT NULL, remote_id TEXT NOT NULL, title TEXT, artist TEXT, album TEXT, duration REAL)",
       "CREATE TABLE IF NOT EXISTS attempts (ip TEXT NOT NULL, ts INTEGER NOT NULL)",
       `CREATE TABLE IF NOT EXISTS tracks (
@@ -96,6 +97,7 @@ function init(env) {
     try { await q("ALTER TABLE tracks ADD COLUMN hash TEXT").run(); } catch {}
     try { await q("ALTER TABLE tracks ADD COLUMN artists TEXT").run(); } catch {}
     try { await q("ALTER TABLE playlists ADD COLUMN cover_v INTEGER NOT NULL DEFAULT 0").run(); } catch {}
+    try { await q("ALTER TABLE user_playlists ADD COLUMN cover_v INTEGER NOT NULL DEFAULT 0").run(); } catch {}
     for (const col of ["status TEXT NOT NULL DEFAULT 'active'", "done_at INTEGER", "meta TEXT", "playlist_id TEXT"])
       try { await q(`ALTER TABLE requests ADD COLUMN ${col}`).run(); } catch {}
     for (const col of ["kind TEXT", "members TEXT"])
@@ -817,10 +819,18 @@ async function api(req, env, url, ctx) {
     return json({ref});
   }
   if (path === "/api/user-playlists" && m === "GET") {
-    const { results } = await DB.prepare("SELECT p.id, p.name, p.user_id, u.username, p.created_at, p.is_public FROM user_playlists p JOIN user_accounts u ON u.id = p.user_id WHERE p.is_public = 1 ORDER BY p.created_at DESC").all();
+    const { results } = await DB.prepare("SELECT p.id, p.name, p.user_id, u.username, p.created_at, p.is_public, p.cover_v FROM user_playlists p JOIN user_accounts u ON u.id = p.user_id WHERE p.is_public = 1 ORDER BY p.created_at DESC").all();
     const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks").all()).results;
     const by = {}; for (const l of links) (by[l.playlist_id] ??= []).push(l.track_id);
-    return json(results.map(p => ({ ...p, tracks: by[p.id] || [] })));
+    return json(results.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
+  }
+  if(path==="/api/playlist-heart" && m==="POST"){
+    const b=await req.json().catch(()=>({})), id=clean(b.id,220);
+    if(!id)return json({error:"Playlist required."},400);
+    const visitor=getCookie(req,"riffvault_heart") || crypto.randomUUID();
+    await DB.prepare("INSERT OR IGNORE INTO playlist_hearts (playlist_id,voter) VALUES (?,?)").bind(id,visitor).run();
+    const row=await DB.prepare("SELECT COUNT(*) AS n FROM playlist_hearts WHERE playlist_id = ?").bind(id).first();
+    return json({hearts:row.n},200,{"set-cookie":`riffvault_heart=${visitor}; Path=/; SameSite=Lax; Max-Age=31536000`});
   }
   if (path === "/api/site" && m === "GET") return json(await siteSettings(DB));
   if (path === "/api/entity-reactions" && m === "GET") {
@@ -1008,12 +1018,48 @@ async function api(req, env, url, ctx) {
 
   const auth = await sessionInfo(req, env);
   if (path.startsWith("/api/user/")) {
+    // Authenticated user operations; admin credentials are handled separately.
+
     if (!auth || auth.role !== "user") return json({ error: "User login required." }, 401);
+    if(path==="/api/user/password" && m==="POST"){
+      const b=await req.json().catch(()=>({}));const password=String(b.password||""), confirm=String(b.confirm||"");
+      if(password.length<8)return json({error:"New password must be at least 8 characters."},400);
+      if(password!==confirm)return json({error:"New passwords do not match."},400);
+      const row=await DB.prepare("SELECT salt,hash FROM user_accounts WHERE id = ?").bind(auth.user_id).first();
+      if(!row || !safeEq(await pbkdf2(String(b.current||""),row.salt),row.hash))return json({error:"Current password is incorrect."},403);
+      const salt=hex(crypto.getRandomValues(new Uint8Array(16)));
+      await DB.prepare("UPDATE user_accounts SET salt = ?, hash = ? WHERE id = ?").bind(salt,await pbkdf2(password,salt),auth.user_id).run();
+      return json({ok:true});
+    }
+    if(path==="/api/user/playlists/copy" && m==="POST"){
+      const b=await req.json().catch(()=>({})),name=clean(b.name,80);
+      if(!name || !Array.isArray(b.tracks) || b.tracks.length>2000)return json({error:"Invalid playlist."},400);
+      const id=crypto.randomUUID();
+      const refs=[];
+      for(const raw of b.tracks){const ref=String(raw);if(ref.length>220)continue;
+        if(await DB.prepare("SELECT id FROM tracks WHERE id = ?").bind(ref).first()){refs.push(ref);continue;}
+        if(/^peer:[a-f0-9]{64}$/.test(ref) && await DB.prepare("SELECT ref FROM peer_track_refs WHERE ref = ?").bind(ref).first()){refs.push(ref);continue;}
+        // Remote tracks must be registered via the peer-track-ref API before copying.
+      }
+      try{await DB.prepare("INSERT INTO user_playlists (id,user_id,name,is_public,created_at) VALUES (?,?,?,?,?)").bind(id,auth.user_id,name,0,Date.now()).run();}
+      catch{return json({error:"You already have a playlist with that name."},409);}
+      for(const ref of new Set(refs))await DB.prepare("INSERT OR IGNORE INTO user_playlist_tracks (playlist_id,track_id,added_at) VALUES (?,?,?)").bind(id,ref,Date.now()).run();
+      return json({id,copied:refs.length,skipped:b.tracks.length-refs.length},201);
+    }
+    if((x=path.match(/^\/api\/user\/playlists\/([\w-]+)\/cover$/)) && m==="PUT"){
+      const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id).first();
+      if(!owned)return json({error:"Playlist not found."},404);
+      const type=(req.headers.get("content-type")||"").split(";")[0];
+      if(!["image/jpeg","image/png","image/webp"].includes(type))return json({error:"JPEG, PNG or WebP required."},415);
+      const bytes=await req.arrayBuffer();if(bytes.byteLength>5*1024*1024)return json({error:"Image exceeds 5 MB."},413);
+      await env.MUSIC.put(`art/user-playlist/${x[1]}`,bytes,{httpMetadata:{contentType:type}});
+      const v=Date.now();await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(v,x[1]).run();return json({ok:true,cover_url:`/art/user-playlist/${x[1]}?v=${v}`});
+    }
     if (path === "/api/user/playlists" && m === "GET") {
-      const pls = (await DB.prepare("SELECT id, name, is_public, created_at FROM user_playlists WHERE user_id = ? ORDER BY created_at DESC").bind(auth.user_id).all()).results;
+      const pls = (await DB.prepare("SELECT id, name, is_public, created_at, cover_v FROM user_playlists WHERE user_id = ? ORDER BY created_at DESC").bind(auth.user_id).all()).results;
       const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks").all()).results;
       const by = {}; for (const l of links) (by[l.playlist_id] ??= []).push(l.track_id);
-      return json(pls.map(p => ({ ...p, tracks: by[p.id] || [] })));
+      return json(pls.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
     }
     if (path === "/api/user/playlists" && m === "POST") {
       const b = await req.json().catch(() => ({})), name = clean(b.name, 80);
@@ -1420,6 +1466,15 @@ export default {
         if (peerPaths) return new Response(null, { status: 204, headers: CORS_PEER });
       }
       if (url.pathname === "/site/favicon") return withCors(await serveFavicon(env), share);
+      if(url.pathname.startsWith("/art/user-playlist/")){
+        const id=url.pathname.slice("/art/user-playlist/".length);
+        if(!/^[\w-]+$/.test(id))return new Response("Not found",{status:404});
+        const p=await env.DB.prepare("SELECT is_public,user_id FROM user_playlists WHERE id = ?").bind(id).first();
+        const auth=await sessionInfo(req,env);
+        if(!p || (!p.is_public && auth?.user_id!==p.user_id && auth?.role!=="admin"))return new Response("Not found",{status:404});
+        const obj=await env.MUSIC.get(`art/user-playlist/${id}`);if(!obj)return new Response("Not found",{status:404});
+        const h=new Headers();obj.writeHttpMetadata(h);h.set("cache-control","public, max-age=3600");return withCors(new Response(obj.body,{headers:h}),share);
+      }
       if (url.pathname.startsWith("/audio/")) return withCors(await serveAudio(req, env, url.pathname.slice(7)), share);
       if (["/art/album", "/art/artist", "/art/track", "/art/playlist"].includes(url.pathname)) return withCors(await serveArt(env, url), share);
       if (url.pathname.startsWith("/api/")) {

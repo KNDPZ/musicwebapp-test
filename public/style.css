@@ -316,3 +316,17 @@ body.up-open #lyrics.full{right:340px}
 .hnav-left{left:8px}.hnav-right{right:8px}.hscroll:hover .hnav,.hnav:focus-visible{opacity:1}.hnav:hover{background:#343434}
 @media(hover:none){.hnav{opacity:.9}}
 .settings-panel{max-width:550px;padding:18px 0}.user-tabs{display:none}
+
+/* Playlist details and authenticated account pages */
+.account-drop [hidden]{display:none!important}
+.user-playlist-entry{display:block;padding:14px 16px;margin:6px 0;border-radius:10px;background:var(--panel);color:var(--text);text-decoration:none}
+.user-playlist-entry:hover{background:var(--line2)}
+.playlist-detail-hero{display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin:24px 0 28px}
+.playlist-detail-cover{width:min(250px,60vw);aspect-ratio:1;overflow:hidden;border-radius:12px;background:var(--panel)}
+.playlist-detail-cover .art,.playlist-detail-cover .mosaic{width:100%;height:100%;display:block}
+.playlist-cover{width:100%;height:100%;object-fit:cover}
+.playlist-detail-hero h1{margin:4px 0 0}
+.playlist-detail-actions{display:flex;gap:10px;flex-wrap:wrap}
+.playlist-edit,.password-form{display:flex;flex-direction:column;align-items:flex-start;gap:14px;margin:16px 0 30px}
+.playlist-edit label,.password-form label{display:flex;flex-direction:column;gap:6px}
+.playlist-edit input:not([type=checkbox]),.password-form input{min-width:min(320px,75vw)}

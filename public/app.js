@@ -240,7 +240,7 @@ function parse() {
 }
 // Left menu is only the main sections. Sub tabs live in the sticky bar under search.
 function renderNav(tab) {
-  $("#nav").innerHTML = Object.entries(TABS).map(([k, v]) =>
+  $("#nav").innerHTML = Object.entries(TABS).filter(([k]) => !["user","settings"].includes(k) || currentAccount?.authenticated).map(([k, v]) =>
     `<a class="nav-item" href="#${k}"${k === tab ? ' aria-current="page"' : ""}>${v}</a>`).join("");
 }
 function renderSub(tab, sub) {
@@ -299,15 +299,24 @@ function render() {
 function renderPage() {
   const { a, arg } = parse();
   if (a === "user" || a === "settings") {
+    if(currentAccount?.role === "admin" && a === "settings"){location.replace("/admin.html#account");return;}
     renderNav(a === "settings" ? "settings" : "user");renderSub("",null);
     const section=a === "settings" ? "settings" : (arg||"private");
     $("#subbar").hidden = false;$("#subbar").innerHTML = a === "settings" ? "" : `<a href="#user/private" ${section==="private"?'aria-current="page"':""}>Private playlists</a><a href="#user/public" ${section==="public"?'aria-current="page"':""}>Public playlists</a>`;
     $("#list").innerHTML=`<h1>${a==="settings"?"Account settings":"My playlists"}</h1><div id="myLists">Loading…</div>`;
     (async()=>{const me=await (await fetch("/api/me")).json();if(!me.authenticated){$("#myLists").textContent="Sign in to view your playlists.";return;}
-      if(section==="settings"){$("#myLists").innerHTML=`<div class="settings-panel"><p>Signed in as <strong>${esc(me.username)}</strong></p><p class="muted">Your playlists are available from My playlists. Account credentials remain private to this server.</p><button class="btn ghost" id="settingsLogout">Log out</button></div>`;$("#settingsLogout").onclick=async()=>{await fetch("/api/logout",{method:"POST"});location.href="/#home";location.reload();};return;}
+      if(section==="settings"){$("#myLists").innerHTML=`<div class="settings-panel"><p>Signed in as <strong>${esc(me.username)}</strong></p><h2>Change password</h2><form id="changePasswordForm" class="password-form"><label>Current password<input type="password" name="current" required autocomplete="current-password"></label><label>New password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label><label>Confirm new password<input type="password" name="confirm" required minlength="8" autocomplete="new-password"></label><button class="btn" type="submit">Update password</button><p id="passwordFeedback" role="status"></p></form></div>`;$("#changePasswordForm").onsubmit=async e=>{e.preventDefault();const form=e.currentTarget;const b=Object.fromEntries(new FormData(form));const r=await postJSON("/api/user/password",b);const j=await r.json().catch(()=>({}));$("#passwordFeedback").textContent=r.ok?"Password changed successfully.":j.error||"Password change failed.";if(r.ok)form.reset();};return;}
       const r=await fetch("/api/user/playlists");if(!r.ok){$("#myLists").textContent="Unable to load playlists.";return;}
       const pls=(await r.json()).filter(p=>!!p.is_public===(section==="public"));
-      $("#myLists").innerHTML=pls.map(p=>`<p>${esc(p.name)} · ${p.tracks.length} songs</p>`).join("")||"No playlists yet. Use + in the player to create one.";
+      $("#myLists").innerHTML=pls.map(p=>`<a class="user-playlist-entry" href="#userplaylist/${enc(p.id)}">${esc(p.name)} · ${p.tracks.length} songs</a>`).join("")||"No playlists yet. Use + in the player to create one.";
+    })();return;
+  }
+  if(a==="userplaylist"){
+    renderNav("user");renderSub("",null);const el=$("#list");el.innerHTML="Loading playlist…";
+    (async()=>{const r=await fetch("/api/user/playlists");if(!r.ok){el.textContent="Sign in required.";return;}const ps=await r.json();const p=ps.find(x=>x.id===dec(arg));if(!p){el.textContent="Playlist not found.";return;}
+      const ids=p.tracks.filter(id=>byId[id]);el.innerHTML=`<a class="back" href="#user/private">← My playlists</a>${playlistHero(p,ids,p.is_public?"Public playlist":"Private playlist")}<div class="playlist-edit"><label>Name <input id="editPlaylistName" maxlength="80" value="${esc(p.name)}"></label><label><input type="checkbox" id="editPlaylistPublic" ${p.is_public?"checked":""}> Public playlist</label><label>Cover image <input type="file" id="editPlaylistCover" accept="image/jpeg,image/png,image/webp"></label><button class="btn" id="savePlaylist">Save changes</button><p id="editPlaylistMsg" role="status"></p></div>${ids.map((id,i)=>row(byId[id],i+1)).join("")||empty("No playable tracks yet.")}`;
+      el.querySelector(".playlist-copy")?.remove();el.querySelector(".playlist-heart")?.remove();
+      $("#savePlaylist").onclick=async()=>{const name=$("#editPlaylistName").value.trim();const pub=$("#editPlaylistPublic").checked;const r=await fetch(`/api/user/playlists/${enc(p.id)}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({name,is_public:pub})});if(!r.ok){$("#editPlaylistMsg").textContent=(await r.json()).error||"Could not save";return;}const file=$("#editPlaylistCover").files[0];if(file){const cr=await fetch(`/api/user/playlists/${enc(p.id)}/cover`,{method:"PUT",headers:{"content-type":file.type},body:file});if(!cr.ok){$("#editPlaylistMsg").textContent="Saved settings but cover upload failed.";return;}}$("#editPlaylistMsg").textContent="Playlist updated.";};
     })();return;
   }
   if (a === "home") { renderNav(""); renderSub("", null); landing($("#list")); markRows(); return; }
@@ -647,6 +656,11 @@ function reactedPlaylists(el, tab) {
     : empty("Nothing here yet. Playlists show up once someone reacts to them on their page.");
 }
 
+function playlistHero(p,ids,subtitle){
+ const src=p.cover_url ? (p.origin && p.cover_url.startsWith("/") ? p.origin+p.cover_url : p.cover_url) : (p.image || "");
+ const cover=src?`<img class="playlist-cover" src="${esc(src)}" alt="${esc(p.name)} cover" onerror="this.style.display='none'">`:mosaic(p);
+ return `<div class="playlist-detail-hero"><div class="playlist-detail-cover">${cover}</div><h1>${esc(p.name)}</h1><p class="muted">${esc(subtitle)}</p><div class="playlist-detail-actions"><button class="btn ghost playlist-heart" data-heart-playlist="${esc(p.id)}" title="Heart this playlist" aria-label="Heart playlist">♡ Heart</button><button class="btn playlist-copy" data-copy-playlist="${esc(p.id)}" title="Copy playlist to your account" aria-label="Copy playlist">＋ Copy to my playlists</button></div></div>`;
+}
 function playlistPage(el, id) {
   const remote=peerPlaylists.find(p=>p.id===id);
   const user=userPublicPlaylists.find(p=>p.id===id);
@@ -654,7 +668,7 @@ function playlistPage(el, id) {
     const p=remote||user;
     const ids=p.tracks.map(i=>{if(!remote)return i;const raw=String(i);if(raw.startsWith("peer:"))return raw;const remoteId=raw.startsWith(p.origin+"|")?raw.slice(p.origin.length+1):raw;return byId[p.origin+"|"+remoteId]?p.origin+"|"+remoteId:remoteId;}).filter(i=>byId[i]);
     noView();
-    el.innerHTML=`<a class="back" href="#playlists/${remote?"peer":"users"}">← Playlists</a><h1>${esc(p.name)}</h1><p class="muted">${remote?"Peer playlist":"Public user playlist"}</p>${ids.map((i,n)=>row(byId[i],n+1)).join("")||empty("Songs are not available from this server.")}`;
+    el.innerHTML=`<a class="back" href="#playlists/${remote?"peer":"users"}">← Playlists</a>${playlistHero(p,ids,remote?"Peer playlist":"Public user playlist")}${ids.map((i,n)=>row(byId[i],n+1)).join("")||empty("Songs are not available from this server.")}`;
     view={ids,label:p.name,pl:p};return;
   }
   const p = playlists.find((x) => x.id === id);
@@ -662,7 +676,7 @@ function playlistPage(el, id) {
   const l = p.tracks.map((i) => byId[i]).filter(Boolean);
   view = { ids: l.map((t) => t.id), label: `Playlist “${p.name}”`, pl: p.id };
   el.innerHTML = `<a class="back" href="#playlists">← All playlists</a>
-    <div class="hero">${mosaic(p)}<div><h1>${esc(p.name)}</h1><span class="muted">${plural(l.length, "song")}</span>${actions(false, { type: "playlist", key: p.id })}</div></div>
+    ${playlistHero(p,l.map(t=>t.id),plural(l.length,"song"))}
     ${l.map((t, i) => row(t, i + 1, "", true)).join("")}`;
 }
 
@@ -1111,7 +1125,9 @@ async function addToPlaylist(id,ids){
   }
 }
 $("#playlistAdd").addEventListener("click",()=>{const t=cur();if(t)openPlaylistAdd([t.id]);});
-document.addEventListener("click",e=>{
+document.addEventListener("click",async e=>{
+  const heart=e.target.closest("[data-heart-playlist]");if(heart){const id=heart.dataset.heartPlaylist;const r=await postJSON("/api/playlist-heart",{id});const j=await r.json().catch(()=>({}));if(r.ok)heart.textContent=`♥ ${j.hearts} hearts`;else alert(j.error||"Could not heart playlist");return;}
+  const copy=e.target.closest("[data-copy-playlist]");if(copy){if(currentAccount?.role!=="user"){alert("Sign in with a user account to copy playlists.");return;}const id=copy.dataset.copyPlaylist;const p=[...playlists,...peerPlaylists,...userPublicPlaylists].find(x=>x.id===id);if(!p)return;const name=prompt("Name for your copy",p.name+" (copy)");if(!name?.trim())return;copy.disabled=true;try{const refs=[];for(const tid of p.tracks){const t=byId[tid];if(t?.origin){const r=await postJSON("/api/peer-track-ref",{origin:t.origin,id:t.id,title:t.title,artist:primaryArtist(t),album:albumName(t),duration:t.duration});if(r.ok)refs.push((await r.json()).ref);}else refs.push(tid);}const r=await postJSON("/api/user/playlists/copy",{name:name.trim(),tracks:refs});const j=await r.json();if(!r.ok)throw Error(j.error||"Copy failed");location.hash="#userplaylist/"+enc(j.id);}catch(err){alert(err.message);}finally{copy.disabled=false;}return;}
   const b=e.target.closest(".album-add");if(b)openPlaylistAdd(b.dataset.albumIds.split(","));
   const arrow=e.target.closest(".hnav");if(arrow){const sc=arrow.closest(".hsec")?.querySelector(".hrow");sc?.scrollBy({left:Number(arrow.dataset.scroll)*Math.max(240,sc.clientWidth*.8),behavior:"smooth"});}
 });
