@@ -330,3 +330,28 @@ body.up-open #lyrics.full{right:340px}
 .playlist-edit,.password-form{display:flex;flex-direction:column;align-items:flex-start;gap:14px;margin:16px 0 30px}
 .playlist-edit label,.password-form label{display:flex;flex-direction:column;gap:6px}
 .playlist-edit input:not([type=checkbox]),.password-form input{min-width:min(320px,75vw)}
+
+/* RiffVault playlist detail and modal polish */
+.owned-playlist-header{position:relative;width:max-content;max-width:100%}
+.owned-playlist-header .playlist-detail-hero{margin-bottom:18px}
+.playlist-cog{position:absolute;right:10px;top:10px;width:38px;height:38px;display:grid;place-items:center;background:#202020e8;color:var(--text);border:1px solid var(--line2);border-radius:50%;font-size:22px;cursor:pointer;transition:background .15s,transform .15s}
+.playlist-cog:hover,.playlist-cog:focus-visible{background:var(--accent);color:#111;transform:rotate(30deg)}
+.playlist-edit.card{max-width:470px;margin:10px 0 28px;align-items:stretch;padding:24px;gap:18px}
+.playlist-edit.card.hidden{display:none!important}
+.playlist-edit.card label{display:flex;flex-direction:column;gap:8px;font-size:14px;font-weight:600}
+.playlist-edit.card input:not([type=checkbox]){box-sizing:border-box;width:100%;min-width:0;max-width:100%}
+.playlist-edit.card .playlist-check{flex-direction:row;align-items:center;gap:10px}
+.playlist-edit-actions{display:flex;gap:10px;flex-wrap:wrap}
+.playlist-track-list{width:100%;margin-top:20px}
+.playlist-dialog{box-sizing:border-box;width:min(440px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100dvh - 36px);overflow-x:hidden;overflow-y:auto;padding:24px;border-radius:16px}
+.playlist-dialog-content{display:flex;flex-direction:column;gap:12px;min-width:0;width:100%;box-sizing:border-box}
+.playlist-dialog-content h2{margin:0 0 12px;font-size:24px}
+.playlist-dialog-content label{font-size:14px;font-weight:600}
+.playlist-dialog-content input:not([type=checkbox]),.playlist-dialog-content select{box-sizing:border-box;min-width:0;max-width:100%;width:100%;height:46px;border:1px solid var(--line2);border-radius:9px;background:var(--bg);color:var(--text);padding:10px 12px;font:inherit}
+.playlist-dialog-content .playlist-check{display:flex;align-items:center;gap:9px;cursor:pointer}
+.playlist-dialog-content .playlist-check input{width:17px;height:17px;accent-color:var(--accent)}
+.playlist-dialog-divider{color:var(--muted);font-size:13px;margin:10px 0 2px}
+.playlist-dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:8px;flex-wrap:wrap}
+.admin-account-shortcut{padding:14px 10px 4px}
+.admin-account-pill{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 13px;border-radius:22px;background:var(--panel);color:var(--text);text-decoration:none;font-weight:600;font-size:13px}
+.admin-account-pill:hover{background:var(--accent);color:#111}
