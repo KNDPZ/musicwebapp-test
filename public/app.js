@@ -23,6 +23,7 @@ const TABS = { recent: "Recently added", top: "Most listened", artists: "Artists
 const KEY = { heart: "hearts", like: "likes", dislike: "dislikes" };
 
 let tracks = [], byId = {}, playlists = [], userPublicPlaylists = [], peerPlaylists = [], query = "";
+let peerTrackLookup = new Map();
 let view = { ids: [], label: "", pl: null }; // what the main area is showing (what a click on a row plays)
 let queue = [], qi = -1, qLabel = "", ctxPl = null; // what is playing, and the playlist it came from
 let repeat = store.get("rep", 0), left = 0, counted = false, shufKind = "";
@@ -190,6 +191,7 @@ async function load() {
   paintBoot(90, "Network peers");
   const localIds = new Set(tracks.map((x) => x.id));
   const remote = await loadPeers(localIds);
+  peerTrackLookup = new Map(remote.map(t=>[t.origin+"|"+t.id,t]));
   try {
     const peers=arr(await (await fetch("/api/network/peers")).json());
     await Promise.all(peers.map(async peer=>{
@@ -206,6 +208,12 @@ async function load() {
   if (remote.length) tracks = dedupeCatalogue(tracks.concat(remote));
   else tracks = dedupeCatalogue(tracks);
   byId = Object.fromEntries(tracks.map((x) => [x.id, x]));
+  // Keep peer playlist tracks addressable even when catalogue deduplication hides them.
+  for(const [key,t] of peerTrackLookup) if(!byId[key]) byId[key]={...t,id:key,remote_id:t.id};
+  try {
+    const r=await fetch("/api/user/peer-tracks");
+    if(r.ok)for(const t of await r.json())if(!byId[t.id])byId[t.id]={...t,remote_id:t.remote_id,origin:t.origin,artists:[t.artist],cover_url:t.cover_url};
+  } catch {}
   paintBoot(100, "Songs, artists and playlists");
   render();
   hideBoot();
@@ -308,7 +316,8 @@ function renderPage() {
       if(section==="settings"){$("#myLists").innerHTML=`<div class="settings-panel"><p>Signed in as <strong>${esc(me.username)}</strong></p><h2>Change password</h2><form id="changePasswordForm" class="password-form"><label>Current password<input type="password" name="current" required autocomplete="current-password"></label><label>New password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label><label>Confirm new password<input type="password" name="confirm" required minlength="8" autocomplete="new-password"></label><button class="btn" type="submit">Update password</button><p id="passwordFeedback" role="status"></p></form></div>`;$("#changePasswordForm").onsubmit=async e=>{e.preventDefault();const form=e.currentTarget;const b=Object.fromEntries(new FormData(form));const r=await postJSON("/api/user/password",b);const j=await r.json().catch(()=>({}));$("#passwordFeedback").textContent=r.ok?"Password changed successfully.":j.error||"Password change failed.";if(r.ok)form.reset();};return;}
       const r=await fetch("/api/user/playlists");if(!r.ok){$("#myLists").textContent="Unable to load playlists.";return;}
       const pls=(await r.json()).filter(p=>!!p.is_public===(section==="public"));
-      $("#myLists").innerHTML=pls.map(p=>`<a class="user-playlist-entry" href="#userplaylist/${enc(p.id)}">${esc(p.name)} · ${p.tracks.length} songs</a>`).join("")||"No playlists yet. Use + in the player to create one.";
+      const grid=pls.map(p=>`<div class="tile sq pltile"><div class="covwrap"><a class="covlink" href="#userplaylist/${enc(p.id)}" aria-label="Open ${esc(p.name)}">${ownedPlaylistCover(p)}</a></div><a class="ttl" href="#userplaylist/${enc(p.id)}"><b>${esc(p.name)}</b><span class="muted">${plural((p.tracks||[]).length,"song")}</span></a></div>`).join("");
+      $("#myLists").innerHTML=grid?`<div class="grid s">${grid}</div>`:empty("No playlists yet. Use + in the player to create one.");
     })();return;
   }
   if(a==="userplaylist"){
@@ -316,12 +325,8 @@ function renderPage() {
     (async()=>{const r=await fetch("/api/user/playlists");if(!r.ok){el.textContent="Sign in required.";return;}const ps=await r.json();const p=ps.find(x=>x.id===dec(arg));if(!p){el.textContent="Playlist not found.";return;}
       const ids=(p.tracks||[]).map(ref=>typeof ref==="object"?(ref.ref||ref.track_id||ref.id):ref).filter(id=>byId[id]);
       view={ids,label:p.name,pl:p.id};
-      el.innerHTML=`<a class="back" href="#user/${p.is_public?"public":"private"}">← My playlists</a><div class="owned-playlist-header">${playlistHero(p,ids,p.is_public?"Public playlist":"Private playlist")}<button type="button" class="playlist-cog" id="playlistCog" aria-label="Edit playlist settings" title="Edit playlist" aria-expanded="false">⚙</button></div><section id="playlistEditPanel" class="playlist-edit card hidden"><h2>Edit playlist</h2><label>Name<input id="editPlaylistName" maxlength="80" value="${esc(p.name)}"></label><label class="playlist-check"><input type="checkbox" id="editPlaylistPublic" ${p.is_public?"checked":""}> Public playlist</label><label>Cover image<input type="file" id="editPlaylistCover" accept="image/jpeg,image/png,image/webp"></label><div class="playlist-edit-actions"><button class="btn" id="savePlaylist">Save changes</button><button class="btn ghost" id="cancelPlaylistEdit">Cancel</button></div><p id="editPlaylistMsg" role="status"></p></section><div class="playlist-track-list">${ids.map((id,i)=>row(byId[id],i+1)).join("")||empty("No playable tracks yet. Add a song using + in the player.")}</div>`;
-      el.querySelector(".playlist-copy")?.remove();el.querySelector(".playlist-heart")?.remove();
-      const editPanel=el.querySelector("#playlistEditPanel"),cog=el.querySelector("#playlistCog");
-      cog.onclick=()=>{const opening=editPanel.classList.contains("hidden");editPanel.classList.toggle("hidden",!opening);cog.setAttribute("aria-expanded",String(opening));};
-      el.querySelector("#cancelPlaylistEdit").onclick=()=>{editPanel.classList.add("hidden");cog.setAttribute("aria-expanded","false");};
-      el.querySelector("#savePlaylist").onclick=async()=>{const name=el.querySelector("#editPlaylistName").value.trim();const pub=el.querySelector("#editPlaylistPublic").checked;const msg=el.querySelector("#editPlaylistMsg");if(!name){msg.textContent="Enter a playlist name.";return;}const r=await fetch(`/api/user/playlists/${enc(p.id)}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({name,is_public:pub})});if(!r.ok){msg.textContent=(await r.json().catch(()=>({}))).error||"Could not save";return;}const file=el.querySelector("#editPlaylistCover").files[0];if(file){const cr=await fetch(`/api/user/playlists/${enc(p.id)}/cover`,{method:"PUT",headers:{"content-type":file.type},body:file});if(!cr.ok){msg.textContent="Saved settings but cover upload failed.";return;}}render();};
+      el.innerHTML=`<a class="back" href="#user/${p.is_public?"public":"private"}">← My playlists</a><div class="owned-playlist-header"><div class="playlist-detail-hero"><div class="playlist-detail-cover">${ownedPlaylistCover(p)}</div><h1>${esc(p.name)}</h1><p class="muted">${p.is_public?"Public playlist":"Private playlist"}</p></div><button type="button" class="playlist-cog" id="playlistCog" aria-label="Edit playlist settings" title="Edit playlist">⚙</button></div><div class="playlist-track-list">${ids.map((id,i)=>row(byId[id],i+1)).join("")||empty("No playable tracks yet. Add a song using + in the player.")}</div>`;
+      el.querySelector("#playlistCog").onclick=()=>openEditPlaylist(p);
     })();return;
   }
   if (a === "home") { renderNav(""); renderSub("", null); landing($("#list")); markRows(); return; }
@@ -615,6 +620,66 @@ window.addEventListener("message", (e) => { // the slider (a sandboxed frame) as
   if (f && e.source === f.contentWindow && e.data && e.data.type === "ad:shuffle") surpriseMe();
 });
 
+// Owned playlists share one cover rendering path for details, cards, and the editor.
+// A missing copied cover is deliberately rendered as a 9 x 9 album-art collage.
+function albumCollage81(p) {
+  const covers=[],seen=new Set();
+  for(const raw of p.tracks||[]){
+    const ref=typeof raw==="object"?(raw.ref||raw.track_id||raw.id):raw;
+    const t=byId[ref]||peerTrackLookup.get(ref);
+    if(!t)continue;
+    const url=albumArt(t);
+    if(url && !seen.has(url)){seen.add(url);covers.push(url);}
+  }
+  if(!covers.length)return `<span class="playlist-cover-empty" aria-label="No album artwork"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13M9 9l12-2M5 21a4 3 0 1 0 0-6 4 3 0 0 0 0 6zm12-2a4 3 0 1 0 0-6 4 3 0 0 0 0 6z" fill="currentColor"/></svg></span>`;
+  return `<span class="playlist-album-collage" aria-label="Album art from playlist songs">${Array.from({length:81},(_,i)=>`<img loading="lazy" alt="" src="${esc(covers[i%covers.length])}">`).join("")}</span>`;
+}
+function ownedPlaylistCover(p){
+  const fallback=albumCollage81(p);
+  if(p.cover_mode==="mosaic" || !p.cover_url)return fallback;
+  const url=String(p.cover_url);
+  return `<span class="owned-cover-image"><img class="playlist-cover" src="${esc(url)}" alt="${esc(p.name)} cover" onerror="this.parentElement.hidden=true;this.parentElement.nextElementSibling.hidden=false"></span><span class="owned-cover-fallback" hidden>${fallback}</span>`;
+}
+function openEditPlaylist(p){
+  // Rebuild the dialog from current data each time so Cancel always discards edits.
+  document.getElementById("editOwnedPlaylistDlg")?.remove();
+  const modal=document.createElement("dialog");
+  modal.id="editOwnedPlaylistDlg";modal.className="playlist-edit-dialog";
+  modal.innerHTML=`<form method="dialog" class="playlist-edit-modal-content"><div class="playlist-edit-modal-header"><h2>Edit playlist</h2><button class="playlist-modal-close" type="button" id="closePlaylistEdit" aria-label="Close">×</button></div><div class="playlist-edit-preview">${ownedPlaylistCover(p)}</div><div class="playlist-edit-line"><div><span class="playlist-edit-label">Name</span><strong id="currentPlaylistName">${esc(p.name)}</strong></div><button type="button" class="btn ghost" id="changePlaylistName">Change name</button></div><label id="playlistRename" class="playlist-rename hidden">New name<input id="editPlaylistName" maxlength="80" value="${esc(p.name)}"></label><fieldset class="playlist-cover-options"><legend>Playlist image</legend><label class="playlist-choice"><input type="checkbox" id="useCopiedPlaylistImage" ${p.cover_mode!=="mosaic"?"checked":""}><span><strong>Use copied playlist image</strong><small>Keep the original cover when available</small></span></label><p class="muted playlist-cover-note">Uncheck to show a 9 × 9 collage of the songs’ album artwork.</p></fieldset><label class="playlist-upload-label">Upload custom image<input type="file" id="editPlaylistCover" accept="image/jpeg,image/png,image/webp"></label><label class="playlist-choice playlist-public-choice"><input type="checkbox" id="editPlaylistPublic" ${p.is_public?"checked":""}>Public playlist</label><p id="editPlaylistMsg" class="msg err" role="alert"></p><div class="playlist-edit-actions"><button class="btn ghost" id="cancelPlaylistEdit" type="button">Cancel</button><button class="btn" id="savePlaylist" type="button">Save changes</button></div></form>`;
+  document.body.append(modal);modal.showModal();
+  let previewUrl=null;
+  const preview=modal.querySelector(".playlist-edit-preview");
+  const fileInput=modal.querySelector("#editPlaylistCover");
+  const copyCheck=modal.querySelector("#useCopiedPlaylistImage");
+  const setPreview=()=>{
+    if(previewUrl){URL.revokeObjectURL(previewUrl);previewUrl=null;}
+    if(fileInput.files[0]){previewUrl=URL.createObjectURL(fileInput.files[0]);preview.innerHTML=`<img class="playlist-cover" src="${esc(previewUrl)}" alt="New playlist cover">`;return;}
+    preview.innerHTML=copyCheck.checked?ownedPlaylistCover(p):albumCollage81(p);
+  };
+  fileInput.onchange=()=>{if(fileInput.files[0])copyCheck.checked=true;setPreview();};
+  copyCheck.onchange=()=>{fileInput.value="";setPreview();};
+  modal.querySelector("#changePlaylistName").onclick=()=>{modal.querySelector("#playlistRename").classList.toggle("hidden");modal.querySelector("#editPlaylistName").focus();};
+  const cleanup=()=>{if(previewUrl)URL.revokeObjectURL(previewUrl);modal.remove();};
+  modal.addEventListener("close",cleanup,{once:true});
+  modal.querySelector("#closePlaylistEdit").onclick=()=>modal.close();
+  modal.querySelector("#cancelPlaylistEdit").onclick=()=>modal.close();
+  modal.querySelector("#savePlaylist").onclick=async()=>{
+    const save=modal.querySelector("#savePlaylist"), msg=modal.querySelector("#editPlaylistMsg");
+    const name=modal.querySelector("#editPlaylistName").value.trim();
+    if(!name){msg.textContent="Playlist name cannot be empty.";return;}
+    const file=fileInput.files[0];
+    if(file && (!["image/jpeg","image/png","image/webp"].includes(file.type)||file.size>5*1024*1024)){msg.textContent="Choose a JPEG, PNG or WebP under 5 MB.";return;}
+    save.disabled=true;msg.textContent="";
+    try{
+      // Upload before changing metadata, so a failed upload won't change the playlist name.
+      if(file){const r=await fetch(`/api/user/playlists/${enc(p.id)}/cover`,{method:"PUT",headers:{"content-type":file.type},body:file});if(!r.ok)throw Error((await r.json().catch(()=>({}))).error||"Cover upload failed.");}
+      const r=await fetch(`/api/user/playlists/${enc(p.id)}`,{method:"PATCH",headers:{"content-type":"application/json"},body:JSON.stringify({name,is_public:modal.querySelector("#editPlaylistPublic").checked,cover_mode:file?"copied":copyCheck.checked?"copied":"mosaic"})});
+      if(!r.ok)throw Error((await r.json().catch(()=>({}))).error||"Unable to save changes.");
+      modal.close();await load();location.hash="#userplaylist/"+enc(p.id);render();popup("Playlist updated","Your playlist changes have been saved successfully.");
+    }catch(e){msg.textContent=e.message||"Unable to save changes.";}finally{save.disabled=false;}
+  };
+}
+
 // Playlist cover: your own image, else 9 different album covers (9+ albums) or a 4-cover grid.
 function mosaic(p) {
   if (p.cover_v) return art(`${p.origin||""}/art/playlist?id=${enc(p.id.split("|").pop())}&v=${p.cover_v}`, p.name);
@@ -663,7 +728,7 @@ function reactedPlaylists(el, tab) {
 
 function playlistHero(p,ids,subtitle){
  const src=p.cover_url ? (p.origin && p.cover_url.startsWith("/") ? p.origin+p.cover_url : p.cover_url) : (p.image || "");
- const cover=src?`<img class="playlist-cover" src="${esc(src)}" alt="${esc(p.name)} cover" onerror="this.style.display='none'">`:mosaic(p);
+ const cover=src?`<img class="playlist-cover" src="${esc(src)}" alt="${esc(p.name)} cover" onerror="this.style.visibility='hidden'">`:mosaic(p);
  return `<div class="playlist-detail-hero"><div class="playlist-detail-cover">${cover}</div><h1>${esc(p.name)}</h1><p class="muted">${esc(subtitle)}</p><div class="playlist-detail-actions"><button class="btn ghost playlist-heart" data-heart-playlist="${esc(p.id)}" title="Heart this playlist" aria-label="Heart playlist">♡ Heart</button><button class="btn playlist-copy" data-copy-playlist="${esc(p.id)}" title="Copy playlist to your account" aria-label="Copy playlist">＋ Copy to my playlists</button></div></div>`;
 }
 function playlistPage(el, id) {
@@ -836,7 +901,7 @@ function play(id) {
   audio.dataset.id = id; counted = false; left = repeat ? repeat - 1 : 0;
   // Skip play-count for remote tracks (they live on another server)
   if (t.origin) counted = true;
-  audio.src = mediaUrl(t, "/audio/" + id);
+  audio.src = mediaUrl(t, "/audio/" + enc(t.remote_id || (t.origin && String(id).startsWith(t.origin+"|") ? String(id).slice(t.origin.length+1) : id)));
   audio.play().catch(() => {});
   $("#pc").innerHTML = art(albumArt(t), albumName(t) || t.title, "lg");
   $("#pt").textContent = t.title; $("#pa").textContent = artistLine(t) + (albumName(t) ? " · " + albumName(t) : "");
@@ -1124,7 +1189,7 @@ async function addToPlaylist(id,ids){
   for(const tid of ids){
     const t=byId[tid];if(!t)continue;
     let ref=tid;
-    if(t.origin){const r=await postJSON("/api/peer-track-ref",{origin:t.origin,id:t.id,title:t.title,artist:primaryArtist(t),album:albumName(t),duration:t.duration});const j=await r.json();if(!r.ok)throw Error(j.error||"Peer unavailable");ref=j.ref;}
+    if(t.origin){const r=await postJSON("/api/peer-track-ref",{origin:t.origin,id:t.remote_id || (t.origin && String(t.id).startsWith(t.origin+"|") ? String(t.id).slice(t.origin.length+1) : t.id),title:t.title,artist:primaryArtist(t),album:albumName(t),duration:t.duration,cover_url:t.cover_url || ""});const j=await r.json();if(!r.ok)throw Error(j.error||"Peer unavailable");ref=j.ref;}
     const r=await postJSON(`/api/user/playlists/${enc(id)}/tracks`,{track_id:ref});
     if(!r.ok)throw Error((await r.json()).error||"Could not add track");
   }
@@ -1132,7 +1197,7 @@ async function addToPlaylist(id,ids){
 $("#playlistAdd").addEventListener("click",()=>{const t=cur();if(t)openPlaylistAdd([t.id]);});
 document.addEventListener("click",async e=>{
   const heart=e.target.closest("[data-heart-playlist]");if(heart){const id=heart.dataset.heartPlaylist;const r=await postJSON("/api/playlist-heart",{id});const j=await r.json().catch(()=>({}));if(r.ok)heart.textContent=`♥ ${j.hearts} hearts`;else alert(j.error||"Could not heart playlist");return;}
-  const copy=e.target.closest("[data-copy-playlist]");if(copy){if(currentAccount?.role!=="user"){alert("Sign in with a user account to copy playlists.");return;}const id=copy.dataset.copyPlaylist;const p=[...playlists,...peerPlaylists,...userPublicPlaylists].find(x=>x.id===id);if(!p)return;const name=prompt("Name for your copy",p.name+" (copy)");if(!name?.trim())return;copy.disabled=true;try{const refs=[];for(const tid of p.tracks){const t=byId[tid];if(t?.origin){const r=await postJSON("/api/peer-track-ref",{origin:t.origin,id:t.id,title:t.title,artist:primaryArtist(t),album:albumName(t),duration:t.duration});if(r.ok)refs.push((await r.json()).ref);}else refs.push(tid);}const r=await postJSON("/api/user/playlists/copy",{name:name.trim(),tracks:refs});const j=await r.json();if(!r.ok)throw Error(j.error||"Copy failed");location.hash="#userplaylist/"+enc(j.id);}catch(err){alert(err.message);}finally{copy.disabled=false;}return;}
+  const copy=e.target.closest("[data-copy-playlist]");if(copy){if(currentAccount?.role!=="user"){alert("Sign in with a user account to copy playlists.");return;}const id=copy.dataset.copyPlaylist;const p=[...playlists,...peerPlaylists,...userPublicPlaylists].find(x=>x.id===id);if(!p)return;const name=prompt("Name for your copy",p.name+" (copy)");if(!name?.trim())return;copy.disabled=true;try{const refs=[];for(const tid of p.tracks){const t=byId[tid] || peerTrackLookup.get(tid);if(t?.origin){const remoteId=t.remote_id || (String(t.id).startsWith(t.origin+"|")?String(t.id).slice(t.origin.length+1):t.id);const r=await postJSON("/api/peer-track-ref",{origin:t.origin,id:remoteId,title:t.title,artist:primaryArtist(t),album:albumName(t),duration:t.duration,cover_url:t.cover_url||""});if(!r.ok)throw Error("Could not cache peer track: "+(t.title||remoteId));refs.push((await r.json()).ref);}else if(tid && byId[tid])refs.push(tid);else throw Error("Playlist track not available: "+tid);}const sourceId=String(p.id).split("|").pop();const cover_url=p.cover_url||p.image||(p.cover_v?(p.kind==="user"||p.user_id?`/art/user-playlist/${enc(sourceId)}`:`/art/playlist?id=${enc(sourceId)}`):"");const r=await postJSON("/api/user/playlists/copy",{name:name.trim(),tracks:refs,source_origin:p.origin||"",source_playlist_id:p.origin?"":sourceId,source_kind:p.kind||"server",cover_url});const j=await r.json();if(!r.ok)throw Error(j.error||"Copy failed");if(j.skipped)alert(j.skipped+" tracks could not be copied.");location.hash="#userplaylist/"+enc(j.id);}catch(err){alert(err.message);}finally{copy.disabled=false;}return;}
   const b=e.target.closest(".album-add");if(b)openPlaylistAdd(b.dataset.albumIds.split(","));
   const arrow=e.target.closest(".hnav");if(arrow){const sc=arrow.closest(".hsec")?.querySelector(".hrow");sc?.scrollBy({left:Number(arrow.dataset.scroll)*Math.max(240,sc.clientWidth*.8),behavior:"smooth"});}
 });

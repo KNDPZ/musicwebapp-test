@@ -98,6 +98,8 @@ function init(env) {
     try { await q("ALTER TABLE tracks ADD COLUMN artists TEXT").run(); } catch {}
     try { await q("ALTER TABLE playlists ADD COLUMN cover_v INTEGER NOT NULL DEFAULT 0").run(); } catch {}
     try { await q("ALTER TABLE user_playlists ADD COLUMN cover_v INTEGER NOT NULL DEFAULT 0").run(); } catch {}
+    try { await q("ALTER TABLE user_playlists ADD COLUMN cover_mode TEXT NOT NULL DEFAULT 'copied'").run(); } catch {}
+    try { await q("ALTER TABLE peer_track_refs ADD COLUMN cover_url TEXT").run(); } catch {}
     for (const col of ["status TEXT NOT NULL DEFAULT 'active'", "done_at INTEGER", "meta TEXT", "playlist_id TEXT"])
       try { await q(`ALTER TABLE requests ADD COLUMN ${col}`).run(); } catch {}
     for (const col of ["kind TEXT", "members TEXT"])
@@ -806,6 +808,12 @@ async function api(req, env, url, ctx) {
     });
     return json(pls.map((p) => ({ ...p, updated_at: Math.max(p.created_at, upd[p.id] || 0), tracks: by[p.id] || [] })));
   }
+  if (path === "/api/user/peer-tracks" && m === "GET") {
+    const auth = await sessionInfo(req, env);
+    if (!auth || auth.role !== "user") return json({error:"Sign in required."},401);
+    const {results} = await DB.prepare("SELECT DISTINCT r.ref AS id, r.origin, r.remote_id, r.title, r.artist, r.album, r.duration, r.cover_url FROM peer_track_refs r JOIN user_playlist_tracks l ON l.track_id = r.ref JOIN user_playlists p ON p.id = l.playlist_id WHERE p.user_id = ?").bind(auth.user_id).all();
+    return json(results);
+  }
   if (path === "/api/peer-track-ref" && m === "POST") {
     const auth = await sessionInfo(req, env);
     if (!auth || auth.role !== "user") return json({error:"Sign in required."},401);
@@ -814,12 +822,13 @@ async function api(req, env, url, ctx) {
     const peer = await DB.prepare("SELECT url FROM peers WHERE url = ?").bind(origin).first();
     if (!peer || !/^[\w-]{1,100}$/.test(remoteId)) return json({error:"Unknown peer or track."},400);
     const ref = "peer:" + await sha256(origin + "\n" + remoteId);
-    await DB.prepare("INSERT OR IGNORE INTO peer_track_refs (ref,origin,remote_id,title,artist,album,duration) VALUES (?,?,?,?,?,?,?)")
-      .bind(ref,origin,remoteId,clean(b.title),clean(b.artist),clean(b.album),Number(b.duration)||0).run();
+    const cover = clean(b.cover_url,500);
+    await DB.prepare("INSERT OR IGNORE INTO peer_track_refs (ref,origin,remote_id,title,artist,album,duration,cover_url) VALUES (?,?,?,?,?,?,?,?)")
+      .bind(ref,origin,remoteId,clean(b.title),clean(b.artist),clean(b.album),Number(b.duration)||0,cover).run();
     return json({ref});
   }
   if (path === "/api/user-playlists" && m === "GET") {
-    const { results } = await DB.prepare("SELECT p.id, p.name, p.user_id, u.username, p.created_at, p.is_public, p.cover_v FROM user_playlists p JOIN user_accounts u ON u.id = p.user_id WHERE p.is_public = 1 ORDER BY p.created_at DESC").all();
+    const { results } = await DB.prepare("SELECT p.id, p.name, p.user_id, u.username, p.created_at, p.is_public, p.cover_v, p.cover_mode FROM user_playlists p JOIN user_accounts u ON u.id = p.user_id WHERE p.is_public = 1 ORDER BY p.created_at DESC").all();
     const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks").all()).results;
     const by = {}; for (const l of links) (by[l.playlist_id] ??= []).push(l.track_id);
     return json(results.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
@@ -1044,7 +1053,66 @@ async function api(req, env, url, ctx) {
       try{await DB.prepare("INSERT INTO user_playlists (id,user_id,name,is_public,created_at) VALUES (?,?,?,?,?)").bind(id,auth.user_id,name,0,Date.now()).run();}
       catch{return json({error:"You already have a playlist with that name."},409);}
       for(const ref of new Set(refs))await DB.prepare("INSERT OR IGNORE INTO user_playlist_tracks (playlist_id,track_id,added_at) VALUES (?,?,?)").bind(id,ref,Date.now()).run();
-      return json({id,copied:refs.length,skipped:b.tracks.length-refs.length},201);
+      let cover_cached=false;
+      // Copy a native cover from the local server/user playlist directly in R2.
+      // No browser-to-Worker roundtrip and no need to re-download existing artwork.
+      if (b.source_playlist_id && !b.source_origin) {
+        const sourceId=clean(b.source_playlist_id,100);
+        const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND (is_public = 1 OR user_id = ?)").bind(sourceId,auth.user_id).first();
+        const server=await DB.prepare("SELECT id FROM playlists WHERE id = ?").bind(sourceId).first();
+        const sourceKey=owned?`art/user-playlist/${sourceId}`:server?`art/playlist/${sourceId}`:null;
+        if(sourceKey){
+          const image=await env.MUSIC.get(sourceKey);
+          if(image){await env.MUSIC.put(`art/user-playlist/${id}`,await image.arrayBuffer(),{httpMetadata:image.httpMetadata});
+            await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(Date.now(),id).run();cover_cached=true;}
+        }
+      }
+      if (!cover_cached && b.cover_url && b.source_origin) {
+        try {
+          const origin = new URL(String(b.source_origin));
+          const peer = await DB.prepare("SELECT url FROM peers WHERE url = ?").bind(origin.origin).first();
+          // Only fetch from a configured peer; no redirects or arbitrary URL fetching.
+          if (peer && origin.protocol === "https:") {
+            const url = new URL(String(b.cover_url),origin.origin);
+            if (url.origin === origin.origin && ["https:"].includes(url.protocol)) {
+              const response = await fetch(url.href,{redirect:"error",signal:AbortSignal.timeout(8000)});
+              const type=(response.headers.get("content-type")||"").split(";")[0];
+              const length=Number(response.headers.get("content-length")||0);
+              if(response.ok && ["image/jpeg","image/png","image/webp"].includes(type) && length<=5*1024*1024) {
+                const bytes=await response.arrayBuffer();
+                if(bytes.byteLength<=5*1024*1024) {
+                  await env.MUSIC.put(`art/user-playlist/${id}`,bytes,{httpMetadata:{contentType:type}});
+                  await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(Date.now(),id).run();
+                  cover_cached=true;
+                }
+              }
+            }
+          }
+        } catch(e) { console.warn("Peer cover cache failed",e.message); }
+      }
+      // If the source playlist has no explicit cover, cache artwork from its first
+      // remote track. This keeps the copied playlist visually useful offline.
+      if (!cover_cached && refs.length) {
+        try {
+          const first = await DB.prepare("SELECT origin,remote_id FROM peer_track_refs WHERE ref = ?").bind(refs[0]).first();
+          if (first && new URL(first.origin).protocol === "https:" &&
+              await DB.prepare("SELECT url FROM peers WHERE url = ?").bind(first.origin).first()) {
+            const artUrl = first.origin + "/art/track?id=" + encodeURIComponent(first.remote_id);
+            const response = await fetch(artUrl,{redirect:"error",signal:AbortSignal.timeout(8000)});
+            const type=(response.headers.get("content-type")||"").split(";")[0];
+            const length=Number(response.headers.get("content-length")||0);
+            if(response.ok && ["image/jpeg","image/png","image/webp"].includes(type) && length<=5*1024*1024) {
+              const bytes=await response.arrayBuffer();
+              if(bytes.byteLength<=5*1024*1024){
+                await env.MUSIC.put(`art/user-playlist/${id}`,bytes,{httpMetadata:{contentType:type}});
+                await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(Date.now(),id).run();
+                cover_cached=true;
+              }
+            }
+          }
+        } catch(e) { console.warn("Peer track artwork cache failed",e.message); }
+      }
+      return json({id,copied:refs.length,skipped:b.tracks.length-refs.length,cover_cached},201);
     }
     if((x=path.match(/^\/api\/user\/playlists\/([\w-]+)\/cover$/)) && m==="PUT"){
       const owned=await DB.prepare("SELECT id FROM user_playlists WHERE id = ? AND user_id = ?").bind(x[1],auth.user_id).first();
@@ -1056,7 +1124,7 @@ async function api(req, env, url, ctx) {
       const v=Date.now();await DB.prepare("UPDATE user_playlists SET cover_v = ? WHERE id = ?").bind(v,x[1]).run();return json({ok:true,cover_url:`/art/user-playlist/${x[1]}?v=${v}`});
     }
     if (path === "/api/user/playlists" && m === "GET") {
-      const pls = (await DB.prepare("SELECT id, name, is_public, created_at, cover_v FROM user_playlists WHERE user_id = ? ORDER BY created_at DESC").bind(auth.user_id).all()).results;
+      const pls = (await DB.prepare("SELECT id, name, is_public, created_at, cover_v, cover_mode FROM user_playlists WHERE user_id = ? ORDER BY created_at DESC").bind(auth.user_id).all()).results;
       const links = (await DB.prepare("SELECT playlist_id, track_id FROM user_playlist_tracks").all()).results;
       const by = {}; for (const l of links) (by[l.playlist_id] ??= []).push(l.track_id);
       return json(pls.map(p => ({ ...p, tracks: by[p.id] || [], cover_url:p.cover_v ? `/art/user-playlist/${p.id}?v=${p.cover_v}` : null })));
@@ -1071,7 +1139,8 @@ async function api(req, env, url, ctx) {
     }
     if ((x = path.match(/^\/api\/user\/playlists\/([\w-]+)$/)) && m === "PATCH") {
       const b = await req.json().catch(() => ({}));
-      const r = await DB.prepare("UPDATE user_playlists SET name = COALESCE(?,name), is_public = COALESCE(?,is_public) WHERE id = ? AND user_id = ?").bind(b.name ? clean(b.name,80) : null, b.is_public === undefined ? null : (b.is_public?1:0), x[1], auth.user_id).run();
+      if (b.cover_mode !== undefined && !["copied","mosaic"].includes(b.cover_mode))return json({error:"Invalid cover mode."},400);
+      const r = await DB.prepare("UPDATE user_playlists SET name = COALESCE(?,name), is_public = COALESCE(?,is_public), cover_mode = COALESCE(?,cover_mode) WHERE id = ? AND user_id = ?").bind(b.name ? clean(b.name,80) : null, b.is_public === undefined ? null : (b.is_public?1:0), b.cover_mode ?? null, x[1], auth.user_id).run();
       return json({ ok: true });
     }
     if ((x = path.match(/^\/api\/user\/playlists\/([\w-]+)\/tracks$/)) && m === "POST") {
@@ -1480,7 +1549,7 @@ export default {
       if (url.pathname.startsWith("/api/")) {
         const res = await api(req, env, url, ctx);
         // CORS only on public read endpoints (not admin)
-        const publicPeer = share && (url.pathname === "/api/tracks" || url.pathname === "/api/playlists" || url.pathname === "/api/site" || url.pathname === "/api/peer" || url.pathname === "/api/network/peers");
+        const publicPeer = share && (url.pathname === "/api/tracks" || url.pathname === "/api/playlists" || url.pathname === "/api/user-playlists" || url.pathname === "/api/site" || url.pathname === "/api/peer" || url.pathname === "/api/network/peers");
         return withCors(res, publicPeer);
       }
     } catch (e) {
